@@ -105,6 +105,13 @@ def solve(hours: List[Any], battery: Any, directives: List[Dict[str, Any]]) -> O
 
     # End-of-day neutrality is an unconditional hard rule (Sec 9.6): it
     # overrides any reserve directive that would otherwise touch hour 23.
+    # Track this per-hour SOC lower bound separately from `reserve_lower` so
+    # the result-extraction loop below can clip against the SAME effective
+    # bound the LP actually solved with, instead of the un-overridden base
+    # reserve (which would wrongly clip hour 23 back up to the base/directive
+    # reserve even when that's above `initial_energy_kwh`).
+    soc_lower_bound = list(reserve_lower)
+    soc_lower_bound[n - 1] = battery.initial_energy_kwh
     bounds[_var_index(n - 1, 4)] = (battery.initial_energy_kwh, battery.initial_energy_kwh)
 
     a_eq: List[List[float]] = []
@@ -175,8 +182,9 @@ def solve(hours: List[Any], battery: Any, directives: List[Dict[str, Any]]) -> O
             grid = 0.0
 
         soc_running = soc_running + charge - discharge
-        # Clip tiny floating noise at the bounds.
-        soc_running = min(max(soc_running, reserve_lower[h]), battery.capacity_kwh)
+        # Clip tiny floating noise at the bounds (using the SAME effective
+        # lower bound the LP solved against -- see soc_lower_bound above).
+        soc_running = min(max(soc_running, soc_lower_bound[h]), battery.capacity_kwh)
 
         if charge > 0.0:
             action, magnitude = "charge", charge

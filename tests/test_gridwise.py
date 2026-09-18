@@ -120,8 +120,8 @@ def test_validator_invalid_llm_output_is_safe():
          "minimum_energy_kwh": None, "max_grid_kwh": None, "explanation": "out of range factor"},
         {"note_index": 1, "directive_type": "teleport_energy", "hours": [1], "factor": None,
          "minimum_energy_kwh": None, "max_grid_kwh": None, "explanation": "unsupported type"},
-        {"note_index": 2, "directive_type": "no_charge_window", "hours": [5, 3], "factor": None,
-         "minimum_energy_kwh": None, "max_grid_kwh": None, "explanation": "hours not ascending"},
+        {"note_index": 2, "directive_type": "no_charge_window", "hours": ["5pm"], "factor": None,
+         "minimum_energy_kwh": None, "max_grid_kwh": None, "explanation": "hour is not an integer"},
         {"note_index": 3, "directive_type": "no_charge_window", "hours": [5, 5], "factor": None,
          "minimum_energy_kwh": None, "max_grid_kwh": None, "explanation": "duplicate hour"},
         {"note_index": 4, "directive_type": "no_charge_window", "hours": [30], "factor": None,
@@ -140,6 +140,21 @@ def test_validator_impossible_reserve_value():
     ]
     result = validate_directives(raw, num_notes=1, battery_capacity_kwh=200)
     check("validator: reserve above battery capacity -> no_op", result[0]["directive_type"] == "no_op")
+
+
+def test_validator_out_of_order_hours_are_sorted_not_rejected():
+    """Regression test: an overnight window like '11 PM to 2 AM' may come back
+    from the model as [23, 0, 1] (chronological order) instead of ascending
+    [0, 1, 23]. The guardrail must normalize this, not throw away a correct
+    directive just because of ordering."""
+    raw = [
+        {"note_index": 0, "directive_type": "no_charge_window", "hours": [23, 0, 1], "factor": None,
+         "minimum_energy_kwh": None, "max_grid_kwh": None, "explanation": "overnight window"},
+    ]
+    result = validate_directives(raw, num_notes=1, battery_capacity_kwh=200)
+    check("validator: out-of-order (overnight) hours are accepted and sorted, not downgraded to no_op",
+          result[0]["directive_type"] == "no_charge_window"
+          and result[0]["structured_adjustment"] == {"hours": [0, 1, 23]})
 
 
 def test_validator_duplicate_and_out_of_range_note_index():
@@ -332,6 +347,25 @@ def test_optimizer_end_of_day_neutrality():
           abs(plan[-1]["battery_energy_after_kwh"] - 75.0) <= TOL)
 
 
+def test_optimizer_initial_below_minimum_does_not_crash():
+    """Edge case: initial_energy_kwh < minimum_energy_kwh is a self-contradictory
+    input (end-of-day neutrality requires ending at `initial`, but the base rule
+    requires every hour's battery energy >= `minimum`). The Problem Statement
+    guarantees valid judge scenarios never do this, but a malformed/adversarial
+    request might. We must not crash -- end-of-day neutrality (an unconditional
+    rule) wins, and the LP still returns a plan rather than raising."""
+    demand = [50.0] * 24
+    solar = [0.0] * 24
+    tariff = [10.0] * 24
+    hours = _hours(demand, solar, tariff)
+    battery = _battery(initial_energy_kwh=10, minimum_energy_kwh=40, capacity_kwh=200)
+    plan = optimizer.solve(hours, battery, directives=[])
+    check("optimizer: initial < minimum does not crash and still returns a plan", plan is not None)
+    if plan is not None:
+        check("optimizer: end-of-day neutrality still honored even in this contradictory edge case",
+              abs(plan[-1]["battery_energy_after_kwh"] - 10.0) <= TOL)
+
+
 def test_optimizer_overlapping_directives_take_the_stricter_bound():
     """Directive precedence: most restrictive wins when windows overlap."""
     demand = [50.0] * 24
@@ -356,6 +390,7 @@ def run_unit_tests():
     test_validator_valid_each_directive_type()
     test_validator_invalid_llm_output_is_safe()
     test_validator_impossible_reserve_value()
+    test_validator_out_of_order_hours_are_sorted_not_rejected()
     test_validator_duplicate_and_out_of_range_note_index()
     test_optimizer_no_directives_feasible()
     test_optimizer_zero_solar_all_day()
@@ -367,6 +402,7 @@ def run_unit_tests():
     test_optimizer_solar_reduction_caps_usage()
     test_optimizer_battery_capacity_boundaries()
     test_optimizer_end_of_day_neutrality()
+    test_optimizer_initial_below_minimum_does_not_crash()
     test_optimizer_overlapping_directives_take_the_stricter_bound()
 
 

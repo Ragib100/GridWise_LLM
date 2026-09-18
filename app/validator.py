@@ -39,6 +39,19 @@ def _safe_no_op(note_index: int, reason: str) -> Dict[str, Any]:
 
 
 def _validate_hours(raw_hours: Any) -> Optional[List[int]]:
+    """
+    Validate and normalize an hours list from raw LLM output.
+
+    We enforce the substantive guarantees (integers, in range 0-23, unique)
+    but we DO NOT reject a directive just because the model listed the hours
+    out of ascending order. This matters for overnight/wraparound windows
+    like "11 PM to 2 AM": a model may naturally emit [23, 0, 1] (chronological
+    narrative order) instead of the API's required ascending [0, 1, 23]. That
+    is a fully valid, unambiguous set of hours -- rejecting it to no_op would
+    throw away a correct interpretation over pure formatting. We sort here so
+    the API always returns the required ascending order regardless of what
+    order the model produced.
+    """
     if not isinstance(raw_hours, list) or len(raw_hours) == 0:
         return None
     hours: List[int] = []
@@ -55,9 +68,7 @@ def _validate_hours(raw_hours: Any) -> Optional[List[int]]:
         return None
     if len(set(hours)) != len(hours):
         return None
-    if hours != sorted(hours):
-        return None
-    return hours
+    return sorted(hours)
 
 
 def _validate_number(raw: Any) -> Optional[float]:
