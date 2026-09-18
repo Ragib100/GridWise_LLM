@@ -204,6 +204,40 @@ directives (bypassing the LLM): it reproduces the reference optimal cost exactly
 
 ## Docker
 
+### Pull the prebuilt image (fallback deployment)
+
+A public image is published on Docker Hub — no build step needed:
+
+| | |
+|---|---|
+| Image | `ragib100/gridwise-llm` |
+| Tags | `v1`, `latest` |
+| Digest | `sha256:b33a9fed51e87f99ad0852aedc6cf26fbcb41496d69566b1841e8fad9ed4314f` |
+| Port | `8000` (bound on `0.0.0.0`; honors a platform-provided `$PORT`) |
+
+```bash
+docker pull ragib100/gridwise-llm:v1
+# or pin the exact digest:
+docker pull ragib100/gridwise-llm@sha256:b33a9fed51e87f99ad0852aedc6cf26fbcb41496d69566b1841e8fad9ed4314f
+
+# Supply the LLM config at run time (copy .env.example to .env and fill in LLM_API_KEY).
+docker run --rm -p 8000:8000 --env-file .env ragib100/gridwise-llm:v1
+
+# Or pass the variables inline:
+docker run --rm -p 8000:8000 \
+  -e LLM_PROVIDER=gemini -e LLM_MODEL=gemini-3.5-flash-lite \
+  -e LLM_FALLBACK_MODELS=gemini-flash-lite-latest,gemini-3.1-flash-lite \
+  -e LLM_API_KEY=<your-key> \
+  ragib100/gridwise-llm:v1
+
+curl http://localhost:8000/health        # -> {"status":"ok"}
+```
+
+Verified: a clean `docker pull` by digest followed by the `docker run` above answers `/health`
+within a few seconds and returns correct interpretations for the public sample cases.
+
+### Build it yourself
+
 ```bash
 docker build -t gridwise-llm .
 docker run -p 8000:8000 --env-file .env gridwise-llm
