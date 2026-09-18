@@ -16,7 +16,7 @@ swapped without touching this file's call sites:
                            vLLM/Ollama, etc.), or "anthropic" (Claude
                            Messages API, tool-use).
     LLM_MODEL              model name/id for the selected provider, e.g.
-                           "gemini-2.5-flash".
+                           "gemini-3.5-flash-lite".
     LLM_API_KEY            secret key, read only from the environment.
     LLM_BASE_URL           only for provider=openai; override the base URL
                            to point at a non-OpenAI OpenAI-compatible host.
@@ -350,7 +350,7 @@ def _build_attempts() -> list:
     if api_key:
         provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
         base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").strip()
-        models = [os.getenv("LLM_MODEL", "gemini-2.5-flash").strip()]
+        models = [os.getenv("LLM_MODEL", "gemini-3.5-flash-lite").strip()]
         models += [m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "").split(",") if m.strip()]
         seen = set()
         for m in models:

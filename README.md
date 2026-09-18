@@ -136,7 +136,7 @@ See `.env.example`. Copy it to `.env` for local runs (never commit `.env`).
 | Variable | Meaning |
 |---|---|
 | `LLM_PROVIDER` | `gemini` (default — Google Gemini, native structured output), `openai` (any OpenAI-compatible Chat Completions API), or `anthropic` |
-| `LLM_MODEL` | model name/id for the selected provider (default `gemini-2.5-flash`) |
+| `LLM_MODEL` | model name/id for the selected provider (default `gemini-3.5-flash-lite`; deployed with fallbacks `gemini-flash-lite-latest,gemini-3.1-flash-lite`) |
 | `LLM_API_KEY` | secret key, read only from the environment — never hard-coded |
 | `LLM_BASE_URL` | only for `LLM_PROVIDER=openai`; point at a non-OpenAI OpenAI-compatible host (Groq, OpenRouter, a local server, etc.) |
 | `LLM_FALLBACK_MODELS` | comma-separated extra model ids on the same provider, tried in order when the primary returns 429/5xx/404 or times out. **Recommended on free-tier keys** — Gemini free-tier quotas are small and per-model |
@@ -149,19 +149,33 @@ See `.env.example`. Copy it to `.env` for local runs (never commit `.env`).
 **Provider/model is swappable purely through these env vars** — `app/llm.py` dispatches on
 `LLM_PROVIDER`; no code change needed to switch models or providers.
 
-## Local setup & running
+## Local setup & running (copy-paste quickstart)
+
+Requires Python 3.11+ and a Gemini API key (free at https://aistudio.google.com/apikey).
 
 ```bash
+git clone https://github.com/Ragib100/GridWise_LLM.git
+cd GridWise_LLM
 python3 -m venv .venv && source .venv/bin/activate      # optional but recommended
 pip install -r requirements.txt
-cp .env.example .env      # then fill in LLM_PROVIDER / LLM_MODEL / LLM_API_KEY
+cp .env.example .env      # then set LLM_API_KEY (LLM_MODEL / LLM_FALLBACK_MODELS defaults are fine)
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
-Check readiness:
+Check readiness (expected: `{"status":"ok"}`):
 ```bash
 curl http://localhost:8000/health
 ```
+
+Run one public sample case (SAMPLE-01) against the running server:
+```bash
+python3 -c "import json;print(json.dumps(json.load(open('tests/sample_cases.json'))['cases'][0]['input']))" \
+  | curl -s -X POST http://localhost:8000/optimize-energy -H 'Content-Type: application/json' -d @- \
+  | python3 -m json.tool
+```
+Expected: HTTP 200 with `directive_interpretation[0]` = `solar_reduction`, `hours [12, 13]`,
+`factor 0.25`; `directive_interpretation[1]` = `no_op` with `applies: false`; a 24-entry
+`hourly_plan`; and `total_cost_bdt` ≈ 38365.0 (the public reference optimal cost).
 
 ### LLM resilience (fallback chain)
 
@@ -192,6 +206,10 @@ python3 tests/test_gridwise.py all
 `unit` covers: every directive type, `no_op`, malformed/invalid LLM output, out-of-range values,
 duplicate/missing note mappings, battery capacity boundaries, zero solar, high solar,
 cheap-vs-expensive tariff periods, and directive precedence on overlapping windows.
+
+Expected result for every mode: each line prints `[PASS] ...` and the run ends with
+`All checks passed.` (exit code 0). `live` against the public sample set performs 124 checks. Any
+failure prints `[FAIL] <check> -- <detail>` and a summary list, and the exit code is 1.
 
 `live` POSTs each of the 10 cases in `tests/sample_cases.json`, checks `directive_interpretation`
 against the public ground truth, independently replays the returned `hourly_plan` against every
