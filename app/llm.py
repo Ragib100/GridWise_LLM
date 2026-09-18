@@ -20,14 +20,36 @@ swapped without touching this file's call sites:
     LLM_API_KEY            secret key, read only from the environment.
     LLM_BASE_URL           only for provider=openai; override the base URL
                            to point at a non-OpenAI OpenAI-compatible host.
-    LLM_TIMEOUT_SECONDS    per-call timeout, default 20s (endpoint budget is
-                           30s total, so this leaves headroom for the
-                           optimizer + serialization).
+    LLM_TIMEOUT_SECONDS    per-call timeout, default 12s.
+    LLM_TOTAL_BUDGET_SECONDS
+                           wall-clock budget for the whole interpretation
+                           step across all fallback attempts, default 24s
+                           (endpoint budget is 30s total, so this leaves
+                           headroom for the optimizer + serialization).
+    LLM_FALLBACK_MODELS    optional comma-separated list of extra model ids
+                           on the SAME provider, tried in order if the
+                           primary model returns a rate-limit (429), a
+                           server error (5xx), an unknown-model 404, or
+                           times out. Free-tier quotas are small and
+                           per-model, so this multiplies the effective
+                           request budget under judge load.
+    LLM_FALLBACK_PROVIDER / LLM_FALLBACK_MODEL / LLM_FALLBACK_API_KEY /
+    LLM_FALLBACK_BASE_URL  optional secondary provider (e.g. Groq via the
+                           openai-compatible API) tried last, after every
+                           model on the primary provider has failed.
+
+Resilience matters here because the interpretation step is the ONLY place
+the LLM is used: if every attempt fails, main.py degrades every note to
+no_op, which is safe but scores zero on directive interpretation.
 """
 import json
+import logging
 import os
+import time
 
 import requests
+
+logger = logging.getLogger("gridwise.llm")
 
 ALLOWED_DIRECTIVE_TYPES = [
     "solar_reduction",
@@ -300,43 +322,115 @@ def _call_anthropic(payload: dict, model: str, api_key: str, timeout: float) -> 
     raise LLMError("Anthropic response did not include the expected tool_use block.")
 
 
+def _call_provider(provider: str, payload: dict, model: str, api_key: str, base_url: str, timeout: float) -> list:
+    if provider == "gemini":
+        return _call_gemini(payload, model, api_key, timeout)
+    if provider == "anthropic":
+        return _call_anthropic(payload, model, api_key, timeout)
+    return _call_openai_compatible(payload, model, api_key, base_url, timeout)
+
+
+def _is_retryable(exc: Exception) -> bool:
+    """Rate limits, server errors, unknown-model 404s and timeouts are worth
+    trying the next model/provider for; anything else (400 bad request,
+    401/403 bad key) would fail identically on retry with the same key."""
+    if isinstance(exc, requests.HTTPError) and exc.response is not None:
+        code = exc.response.status_code
+        return code == 429 or code == 404 or code >= 500
+    if isinstance(exc, (requests.Timeout, requests.ConnectionError)):
+        return True
+    # Malformed/empty response body from the provider (rare, transient).
+    return isinstance(exc, (json.JSONDecodeError, KeyError, IndexError, TypeError))
+
+
+def _build_attempts() -> list:
+    """Ordered list of (provider, model, api_key, base_url) attempts from env."""
+    attempts = []
+    api_key = os.getenv("LLM_API_KEY", "").strip()
+    if api_key:
+        provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
+        base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").strip()
+        models = [os.getenv("LLM_MODEL", "gemini-2.5-flash").strip()]
+        models += [m.strip() for m in os.getenv("LLM_FALLBACK_MODELS", "").split(",") if m.strip()]
+        seen = set()
+        for m in models:
+            if m and m not in seen:
+                seen.add(m)
+                attempts.append((provider, m, api_key, base_url))
+
+    fb_key = os.getenv("LLM_FALLBACK_API_KEY", "").strip()
+    fb_model = os.getenv("LLM_FALLBACK_MODEL", "").strip()
+    if fb_key and fb_model:
+        fb_provider = os.getenv("LLM_FALLBACK_PROVIDER", "openai").strip().lower()
+        fb_base = os.getenv("LLM_FALLBACK_BASE_URL", "https://api.openai.com/v1").strip()
+        attempts.append((fb_provider, fb_model, fb_key, fb_base))
+    return attempts
+
+
 def interpret_notes(operator_notes: list, hours: list, battery: dict) -> list:
     """
-    Call the configured LLM provider to interpret operator notes.
+    Call the configured LLM provider(s) to interpret operator notes.
+
+    Tries the primary model first, then each LLM_FALLBACK_MODELS entry, then
+    the optional secondary provider, stopping at the first usable response
+    or when LLM_TOTAL_BUDGET_SECONDS is exhausted.
 
     Returns the RAW, UNTRUSTED list of directive dicts exactly as produced by
     the model. Callers must pass this straight into validator.validate_directives
     before it ever reaches the optimizer.
 
-    Raises LLMError on any failure (missing key, network/timeout, malformed
-    response) so main.py can apply the safe no_op fallback.
+    Raises LLMError only when every attempt failed (missing key, quota,
+    network/timeout, malformed response) so main.py can apply the safe
+    no_op fallback.
     """
-    api_key = os.getenv("LLM_API_KEY", "").strip()
-    if not api_key:
+    attempts = _build_attempts()
+    if not attempts:
         raise LLMError("LLM_API_KEY is not configured.")
 
-    provider = os.getenv("LLM_PROVIDER", "gemini").strip().lower()
-    model = os.getenv("LLM_MODEL", "gemini-2.5-flash").strip()
-    timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "20"))
-    base_url = os.getenv("LLM_BASE_URL", "https://api.openai.com/v1").strip()
+    per_call_timeout = float(os.getenv("LLM_TIMEOUT_SECONDS", "12"))
+    total_budget = float(os.getenv("LLM_TOTAL_BUDGET_SECONDS", "24"))
+    started = time.monotonic()
 
     payload = {
         "operator_notes": [{"note_index": i, "text": n} for i, n in enumerate(operator_notes)],
         "context": {"hours": hours, "battery": battery},
     }
 
-    try:
-        if provider == "gemini":
-            raw = _call_gemini(payload, model, api_key, timeout)
-        elif provider == "anthropic":
-            raw = _call_anthropic(payload, model, api_key, timeout)
-        else:
-            raw = _call_openai_compatible(payload, model, api_key, base_url, timeout)
-    except LLMError:
-        raise
-    except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
-        raise LLMError(f"LLM call failed: {exc}") from exc
+    # Free-tier rate limits are per-minute bursts as well as per-day caps, so
+    # after one full pass over the chain fails we pause briefly and try the
+    # whole chain once more, as long as the time budget allows.
+    retry_pause = float(os.getenv("LLM_RETRY_PAUSE_SECONDS", "2"))
+    errors = []
+    for round_no in range(2):
+        if round_no == 1:
+            if total_budget - (time.monotonic() - started) <= retry_pause + 2.0:
+                break
+            logger.warning("All LLM attempts failed once; pausing %.1fs and retrying the chain.", retry_pause)
+            time.sleep(retry_pause)
+        for provider, model, api_key, base_url in attempts:
+            remaining = total_budget - (time.monotonic() - started)
+            if remaining <= 1.0:
+                errors.append("time budget exhausted before trying %s/%s" % (provider, model))
+                break
+            timeout = min(per_call_timeout, remaining)
+            try:
+                raw = _call_provider(provider, payload, model, api_key, base_url, timeout)
+            except LLMError as exc:
+                errors.append(f"{provider}/{model}: {exc}")
+                continue
+            except (requests.RequestException, json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+                errors.append(f"{provider}/{model}: {exc}")
+                if not _is_retryable(exc):
+                    logger.warning("LLM attempt %s/%s failed with a non-retryable error: %s", provider, model, exc)
+                    continue
+                logger.warning("LLM attempt %s/%s failed (%s); trying next fallback.", provider, model, exc)
+                continue
 
-    if not isinstance(raw, list):
-        raise LLMError("LLM response did not contain a directives list.")
-    return raw
+            if not isinstance(raw, list):
+                errors.append(f"{provider}/{model}: response did not contain a directives list")
+                continue
+            if model != attempts[0][1] or provider != attempts[0][0]:
+                logger.info("LLM interpretation served by fallback %s/%s.", provider, model)
+            return raw
+
+    raise LLMError("All LLM attempts failed: " + " | ".join(errors))

@@ -45,6 +45,7 @@ def check(name: str, condition: bool, detail: str = ""):
     print(f"[{status}] {name}" + (f" -- {detail}" if detail and not condition else ""))
     if not condition:
         FAILURES.append(name)
+    return condition
 
 
 def _battery(**kwargs):

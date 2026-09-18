@@ -139,7 +139,11 @@ See `.env.example`. Copy it to `.env` for local runs (never commit `.env`).
 | `LLM_MODEL` | model name/id for the selected provider (default `gemini-2.5-flash`) |
 | `LLM_API_KEY` | secret key, read only from the environment — never hard-coded |
 | `LLM_BASE_URL` | only for `LLM_PROVIDER=openai`; point at a non-OpenAI OpenAI-compatible host (Groq, OpenRouter, a local server, etc.) |
-| `LLM_TIMEOUT_SECONDS` | per-call LLM timeout, default 20s (endpoint budget is 30s) |
+| `LLM_FALLBACK_MODELS` | comma-separated extra model ids on the same provider, tried in order when the primary returns 429/5xx/404 or times out. **Recommended on free-tier keys** — Gemini free-tier quotas are small and per-model |
+| `LLM_FALLBACK_PROVIDER` / `LLM_FALLBACK_MODEL` / `LLM_FALLBACK_API_KEY` / `LLM_FALLBACK_BASE_URL` | optional secondary provider (e.g. Groq via its OpenAI-compatible API) tried last, after every primary-provider model fails |
+| `LLM_TIMEOUT_SECONDS` | per-call LLM timeout, default 12s |
+| `LLM_TOTAL_BUDGET_SECONDS` | wall-clock budget for the whole interpretation step across all fallback attempts, default 24s (endpoint budget is 30s) |
+| `LLM_RETRY_PAUSE_SECONDS` | pause before re-trying the whole chain once more after a fully failed pass, default 2s |
 | `PORT` | port to listen on (hosting platforms usually inject this themselves) |
 
 **Provider/model is swappable purely through these env vars** — `app/llm.py` dispatches on
@@ -159,9 +163,15 @@ Check readiness:
 curl http://localhost:8000/health
 ```
 
-If `LLM_API_KEY` is missing or the LLM call fails for any reason, every note safely becomes
-`no_op` (logged as a warning) instead of the service crashing — the schedule is still computed
-and returned.
+### LLM resilience (fallback chain)
+
+`interpret_notes()` tries the primary `LLM_MODEL` first, then each `LLM_FALLBACK_MODELS` entry,
+then the optional secondary provider; a rate-limit (429), server error (5xx), unknown model (404)
+or timeout moves on to the next attempt, and after one fully failed pass the chain is retried
+once more after `LLM_RETRY_PAUSE_SECONDS`. All attempts share `LLM_TOTAL_BUDGET_SECONDS` so the
+endpoint always answers inside its 30s budget. Only if **every** attempt fails (or
+`LLM_API_KEY` is missing) does every note safely become `no_op` (logged as a warning) instead of
+the service crashing — the schedule is still computed and returned.
 
 ## Testing
 
@@ -238,9 +248,13 @@ etc.) — behavior is what's judged, not the provider. Steps for a typical platf
 - The optimizer assumes no round-trip battery efficiency loss and no grid export, matching the
   official Problem Statement's energy-balance equation (there is no efficiency or export field in
   the request schema).
-- `LLM_TIMEOUT_SECONDS` defaults to 20s with no retry, to stay safely inside the 30s per-request
-  budget; a single slow/unavailable LLM call degrades to `no_op` for that request rather than
-  retrying and risking a timeout.
+- The interpretation step is bounded by `LLM_TOTAL_BUDGET_SECONDS` (default 24s) to stay safely
+  inside the 30s per-request budget; if every model/provider in the fallback chain is
+  unavailable within that budget, that request degrades to `no_op` for all notes rather than
+  timing out.
+- Gemini free-tier keys have very small per-model daily quotas (e.g. 20 requests/day on
+  `gemini-2.5-flash` at the time of writing). Configure `LLM_FALLBACK_MODELS` and/or a billed key
+  or secondary provider for any sustained load.
 - The LP optimizer requires `scipy`; if it's ever unavailable/infeasible, `fallback_plan()`
   provides a always-feasible (but not directive-aware) safety net rather than failing the request.
 
