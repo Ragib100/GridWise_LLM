@@ -22,11 +22,21 @@ schedule itself. Its output is treated as completely untrusted until it passes `
 
 ## Guardrail flow (`app/validator.py`)
 
-Deterministic Python, no second LLM call, never raises. For every note it:
+Deterministic Python, no second LLM call, never raises. Each non-`no_op` directive type has a
+strict Pydantic model in `app/models.py` (`SolarReductionAdjustment`,
+`MinimumBatteryReserveAdjustment`, `NoChargeWindowAdjustment`, `NoDischargeWindowAdjustment`,
+`MaxGridWindowAdjustment`), and the validator dispatches to the right one by `directive_type`
+(`DIRECTIVE_ADJUSTMENT_MODELS`) — a manual discriminated union, since the fixed wire schema keeps
+`directive_type` as a sibling of `structured_adjustment` rather than nested inside it. For every
+note it:
 1. Rejects any `directive_type` not in the six allowed values → downgrades to `no_op`.
-2. Rejects hours that aren't unique ascending integers 0–23 → `no_op`.
-3. Rejects out-of-range numbers (`factor` outside 0–1, reserve above battery capacity, negative
-   grid cap) → `no_op`.
+2. Constructs the matching adjustment model from the raw fields; any `pydantic.ValidationError`
+   (non-integer/out-of-range/duplicate hours, `factor` outside 0–1, negative grid cap, a boolean
+   where a number is required, etc.) → `no_op`. Hours are normalized to ascending order rather
+   than rejected for being out of order, so a model-emitted overnight window like `[23, 0, 1]`
+   ("11 PM to 2 AM") is still accepted as `[0, 1, 23]`.
+3. Separately rejects a reserve value above battery capacity → `no_op` (needs request-level
+   context the per-type model doesn't have).
 4. Fixes note-index bookkeeping: duplicate mappings keep the first valid one, out-of-range or
    missing indices are filled with a safe `no_op`, so the response always has exactly one entry
    per note, in order.
@@ -241,3 +251,12 @@ FastAPI, Uvicorn, Pydantic — HTTP API and request/response validation.
 swap in `app/llm.py` a one-file change).
 NumPy / SciPy (`linprog`, HiGHS) — exact LP solve for the optimizer.
 `python-dotenv` — optional convenience for loading `.env` in local dev only.
+
+## Tooling disclosure
+
+This solution was developed with the help of an AI coding assistant (Claude), used interactively
+throughout design, implementation, and testing. All architecture decisions, the LLM-interpretation
+strategy, the guardrail/validation design, and the LP optimization model were specified and
+reviewed by the author; the assistant was not used to bypass the "no hard-coded phrase matching"
+requirement — `app/llm.py` calls a real LLM for every note, and `app/validator.py` only ever
+validates that model's output deterministically.

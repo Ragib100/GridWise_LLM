@@ -5,7 +5,7 @@ Schema is taken verbatim from the official Problem Statement + the public
 sample case pack (BUP CSE Fest 2026 GridWise LLM preliminary). Do not change
 field names/shapes without re-checking those documents.
 """
-from typing import List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Type
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -103,3 +103,111 @@ class OptimizeResponse(BaseModel):
     total_cost_bdt: float
     peak_grid_kwh: float
     plan_summary: str
+
+
+# ---------------------------------------------------------------------------
+# Directive adjustment models -- strict per-type validation
+# ---------------------------------------------------------------------------
+#
+# The wire schema (fixed by the official spec/sample cases) keeps
+# `directive_type` as a sibling of `structured_adjustment`, not a field
+# nested inside it -- so a real Pydantic `Discriminator`-based union isn't
+# applicable to the wire shape itself. Instead we get the same guarantee
+# ("exactly one strict, type-specific shape per directive_type, chosen by
+# that type") via manual discriminated dispatch: `validator.py` looks up
+# the directive_type in DIRECTIVE_ADJUSTMENT_MODELS and constructs *that*
+# model, which is exactly as strict as a discriminated union would be.
+#
+# These models are never touched by `interpret_notes()` (the LLM layer) --
+# only `validator.py`'s deterministic guardrail calls them, on raw/untrusted
+# LLM output, so a bad value (wrong type, out of range, duplicate hour,
+# a bool where a number is required) raises `pydantic.ValidationError`
+# rather than silently reaching the optimizer.
+
+
+def _reject_bool(v: Any) -> Any:
+    if isinstance(v, bool):
+        raise ValueError("must be a number, not a boolean")
+    return v
+
+
+def _normalize_hours(v: Any) -> List[int]:
+    if not isinstance(v, list) or len(v) == 0:
+        raise ValueError("hours must be a non-empty list")
+    hours: List[int] = []
+    for h in v:
+        if isinstance(h, bool):
+            raise ValueError("hours must be integers, not booleans")
+        if isinstance(h, int):
+            hours.append(h)
+        elif isinstance(h, float) and h.is_integer():
+            hours.append(int(h))
+        else:
+            raise ValueError("hours must be integers")
+    if any(h < 0 or h > 23 for h in hours):
+        raise ValueError("hours must be between 0 and 23")
+    if len(set(hours)) != len(hours):
+        raise ValueError("hours must not contain duplicate values")
+    # Sorted, not rejected, if out of order: an overnight window like
+    # "11 PM to 2 AM" may naturally come back as [23, 0, 1]; that is a
+    # fully valid, unambiguous set of hours and the API's required output
+    # order is ascending regardless of what order the model produced.
+    return sorted(hours)
+
+
+class _HoursAdjustmentBase(BaseModel):
+    """Shared `hours` field/validation for every windowed directive type."""
+
+    hours: List[int]
+
+    @field_validator("hours", mode="before")
+    @classmethod
+    def _validate_hours(cls, v: Any) -> List[int]:
+        return _normalize_hours(v)
+
+
+class SolarReductionAdjustment(_HoursAdjustmentBase):
+    factor: float = Field(ge=0.0, le=1.0)
+
+    @field_validator("factor", mode="before")
+    @classmethod
+    def _factor_not_bool(cls, v: Any) -> Any:
+        return _reject_bool(v)
+
+
+class MinimumBatteryReserveAdjustment(_HoursAdjustmentBase):
+    minimum_energy_kwh: float = Field(ge=0.0)
+
+    @field_validator("minimum_energy_kwh", mode="before")
+    @classmethod
+    def _value_not_bool(cls, v: Any) -> Any:
+        return _reject_bool(v)
+
+
+class NoChargeWindowAdjustment(_HoursAdjustmentBase):
+    pass
+
+
+class NoDischargeWindowAdjustment(_HoursAdjustmentBase):
+    pass
+
+
+class MaxGridWindowAdjustment(_HoursAdjustmentBase):
+    max_grid_kwh: float = Field(ge=0.0)
+
+    @field_validator("max_grid_kwh", mode="before")
+    @classmethod
+    def _value_not_bool(cls, v: Any) -> Any:
+        return _reject_bool(v)
+
+
+# directive_type (string) -> the strict model that validates its
+# structured_adjustment shape. "no_op" carries no adjustment and is
+# handled separately in validator.py, so it has no entry here.
+DIRECTIVE_ADJUSTMENT_MODELS: Dict[str, Type[BaseModel]] = {
+    "solar_reduction": SolarReductionAdjustment,
+    "minimum_battery_reserve": MinimumBatteryReserveAdjustment,
+    "no_charge_window": NoChargeWindowAdjustment,
+    "no_discharge_window": NoDischargeWindowAdjustment,
+    "max_grid_window": MaxGridWindowAdjustment,
+}

@@ -16,7 +16,11 @@ Any directive that fails a check is safely downgraded to no_op rather than
 rejected outright -- a bad LLM response must never crash the service or
 silently reach the optimizer.
 """
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
+
+from pydantic import ValidationError
+
+from .models import DIRECTIVE_ADJUSTMENT_MODELS
 
 ALLOWED_TYPES = {
     "solar_reduction",
@@ -25,6 +29,17 @@ ALLOWED_TYPES = {
     "no_discharge_window",
     "max_grid_window",
     "no_op",
+}
+
+# directive_type -> the raw-payload keys (besides "hours") that get pulled
+# out of the untrusted LLM item and handed to that type's strict Pydantic
+# model in models.DIRECTIVE_ADJUSTMENT_MODELS for validation.
+_EXTRA_FIELDS_BY_TYPE = {
+    "solar_reduction": ("factor",),
+    "minimum_battery_reserve": ("minimum_energy_kwh",),
+    "no_charge_window": (),
+    "no_discharge_window": (),
+    "max_grid_window": ("max_grid_kwh",),
 }
 
 
@@ -36,47 +51,6 @@ def _safe_no_op(note_index: int, reason: str) -> Dict[str, Any]:
         "structured_adjustment": None,
         "explanation": reason,
     }
-
-
-def _validate_hours(raw_hours: Any) -> Optional[List[int]]:
-    """
-    Validate and normalize an hours list from raw LLM output.
-
-    We enforce the substantive guarantees (integers, in range 0-23, unique)
-    but we DO NOT reject a directive just because the model listed the hours
-    out of ascending order. This matters for overnight/wraparound windows
-    like "11 PM to 2 AM": a model may naturally emit [23, 0, 1] (chronological
-    narrative order) instead of the API's required ascending [0, 1, 23]. That
-    is a fully valid, unambiguous set of hours -- rejecting it to no_op would
-    throw away a correct interpretation over pure formatting. We sort here so
-    the API always returns the required ascending order regardless of what
-    order the model produced.
-    """
-    if not isinstance(raw_hours, list) or len(raw_hours) == 0:
-        return None
-    hours: List[int] = []
-    for h in raw_hours:
-        if isinstance(h, bool):
-            return None
-        if isinstance(h, int):
-            hours.append(h)
-        elif isinstance(h, float) and h.is_integer():
-            hours.append(int(h))
-        else:
-            return None
-    if any(h < 0 or h > 23 for h in hours):
-        return None
-    if len(set(hours)) != len(hours):
-        return None
-    return sorted(hours)
-
-
-def _validate_number(raw: Any) -> Optional[float]:
-    if isinstance(raw, bool):
-        return None
-    if isinstance(raw, (int, float)):
-        return float(raw)
-    return None
 
 
 def _validate_single(item: Dict[str, Any], battery_capacity_kwh: float) -> Dict[str, Any]:
@@ -94,67 +68,40 @@ def _validate_single(item: Dict[str, Any], battery_capacity_kwh: float) -> Dict[
     if dtype == "no_op":
         return _safe_no_op(idx, explanation)
 
-    hours = _validate_hours(item.get("hours"))
-    if hours is None:
+    # Every other directive type has a strict Pydantic model (manual
+    # discriminated dispatch keyed by directive_type -- see models.py for
+    # why this isn't a nested-discriminator union). Constructing that model
+    # from the raw, untrusted LLM fields enforces every substantive
+    # guarantee (integer/range/uniqueness on hours, numeric range on the
+    # type-specific value, no booleans coerced into numbers) in one place;
+    # any violation raises ValidationError and we safely downgrade to no_op.
+    model_cls = DIRECTIVE_ADJUSTMENT_MODELS[dtype]
+    raw_payload = {"hours": item.get("hours")}
+    for field in _EXTRA_FIELDS_BY_TYPE[dtype]:
+        raw_payload[field] = item.get(field)
+
+    try:
+        adjustment = model_cls.model_validate(raw_payload)
+    except ValidationError:
         return _safe_no_op(
-            idx, "Directive hours were missing, malformed, or out of range; treated as no_op for safety."
+            idx,
+            f"{dtype} adjustment was missing, malformed, or out of range; treated as no_op for safety.",
         )
 
-    if dtype == "solar_reduction":
-        factor = _validate_number(item.get("factor"))
-        if factor is None or not (0.0 <= factor <= 1.0):
-            return _safe_no_op(
-                idx, "Solar reduction factor was missing or out of the 0-1 range; treated as no_op for safety."
-            )
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": dtype,
-            "structured_adjustment": {"hours": hours, "factor": factor},
-            "explanation": explanation,
-        }
+    # battery_capacity_kwh is request-level context the per-type model has
+    # no way to know, so this bound is checked here rather than in models.py.
+    if dtype == "minimum_battery_reserve" and adjustment.minimum_energy_kwh > battery_capacity_kwh:
+        return _safe_no_op(
+            idx, "Minimum battery reserve value exceeds battery capacity; treated as no_op for safety."
+        )
 
-    if dtype == "minimum_battery_reserve":
-        value = _validate_number(item.get("minimum_energy_kwh"))
-        if value is None or value < 0 or value > battery_capacity_kwh:
-            return _safe_no_op(
-                idx,
-                "Minimum battery reserve value was missing, negative, or above battery capacity; "
-                "treated as no_op for safety.",
-            )
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": dtype,
-            "structured_adjustment": {"hours": hours, "minimum_energy_kwh": value},
-            "explanation": explanation,
-        }
-
-    if dtype in ("no_charge_window", "no_discharge_window"):
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": dtype,
-            "structured_adjustment": {"hours": hours},
-            "explanation": explanation,
-        }
-
-    if dtype == "max_grid_window":
-        value = _validate_number(item.get("max_grid_kwh"))
-        if value is None or value < 0:
-            return _safe_no_op(
-                idx, "Max grid import value was missing or negative; treated as no_op for safety."
-            )
-        return {
-            "note_index": idx,
-            "applies": True,
-            "directive_type": dtype,
-            "structured_adjustment": {"hours": hours, "max_grid_kwh": value},
-            "explanation": explanation,
-        }
-
-    # Unreachable given ALLOWED_TYPES, kept as a last-resort safe fallback.
-    return _safe_no_op(idx, "Unhandled directive type; treated as no_op for safety.")
+    return {
+        "note_index": idx,
+        "applies": True,
+        "directive_type": dtype,
+        "structured_adjustment": adjustment.model_dump(),
+        "explanation": explanation,
+    }
 
 
 def validate_directives(
